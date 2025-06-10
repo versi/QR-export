@@ -16,27 +16,41 @@ try:
 except ImportError:
     USE_CV2 = False
 
-# Paramètres RS
-DATA_CHUNKS = 6
-TOTAL_CHUNKS = 10
-CHUNK_SIZE = 200  # octets
+# RS parameters (modifiable)
+K = 7              # nombre de chunks data par groupe
+N = 10             # total chunks par groupe (data + parité)
+CHUNK_SIZE = 150   # taille en octets d’un chunk
 
-def sha256(data):
+def sha256(data: bytes) -> str:
+    """Calcule le hash SHA-256 d'un buffer."""
     return hashlib.sha256(data).hexdigest()
 
-def split_and_pad(data, chunk_size, target_chunks):
-    chunks = [data[i:i+chunk_size] for i in range(0, len(data), chunk_size)]
-    while len(chunks) < target_chunks:
-        chunks.append(b'\x00' * chunk_size)
-    return chunks
+def split_file_in_chunks(data: bytes, chunk_size: int) -> list:
+    """Découpe les données en chunks de taille chunk_size."""
+    return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
 
-def encode_rs_chunks(chunks, n, k):
+def pad_chunk(chunk: bytes, size: int) -> bytes:
+    """Pad un chunk pour atteindre la taille size (ajoute des \x00)."""
+    return chunk + b'\x00' * (size - len(chunk))
+
+def encode_rs_group(data_chunks: list, n: int, k: int) -> list:
+    """
+    Encode un groupe de k chunks avec RS pour générer n-k chunks de parité.
+    Renvoie une liste de n chunks (k data + n-k parité).
+    Chaque chunk est de taille chunk_size (après padding).
+    """
     rs = RSCodec(n - k)
-    encoded = rs.encode(b''.join(chunks))
-    block_size = len(encoded) // n
-    return [encoded[i:i+block_size] for i in range(0, len(encoded), block_size)]
+    # Concatène les chunks data en un seul buffer
+    group_data = b''.join(data_chunks)
+    # Encode le groupe entier
+    encoded = rs.encode(group_data)
+    # Taille de chaque chunk encodé
+    chunk_len = len(encoded) // n
+    # Découpe en n chunks
+    return [encoded[i * chunk_len:(i + 1) * chunk_len] for i in range(n)]
 
-def show_qr_image(img):
+def show_qr_image(img: Image.Image) -> None:
+    """Affiche une image QR code avec OpenCV ou PIL."""
     if USE_CV2:
         img_cv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
         cv2.imshow("QR Code", img_cv)
@@ -44,45 +58,76 @@ def show_qr_image(img):
     else:
         img.show()
 
-def encode_and_show(file_path, interval_ms):
-    with open(file_path, 'rb') as f:
+def encode_file_to_qrs(file_path: str, interval_ms: int) -> None:
+    """Encode le fichier en QR codes diffusés à l'écran avec correction d'erreur RS par groupe."""
+    with open(file_path, "rb") as f:
         data = f.read()
 
     filename = os.path.basename(file_path)
     file_hash = sha256(data)
 
-    chunks = split_and_pad(data, CHUNK_SIZE, DATA_CHUNKS)
-    rs_chunks = encode_rs_chunks(chunks, TOTAL_CHUNKS, DATA_CHUNKS)
+    # Découpe tout le fichier en chunks (non pad pour l’instant)
+    all_chunks = split_file_in_chunks(data, CHUNK_SIZE)
 
-    print(f"📡 Diffusion des QR codes toutes les {interval_ms} ms (RS({TOTAL_CHUNKS},{DATA_CHUNKS}))")
+    # Nombre total de groupes
+    total_groups = (len(all_chunks) + K - 1) // K
 
-    for i, chunk in enumerate(rs_chunks):
-        payload = {
-            "index": i,
-            "total": TOTAL_CHUNKS,
-            "filename": filename,
-            "file_hash": file_hash,
-            "chunk_hash": sha256(chunk),
-            "rs_k": DATA_CHUNKS,
-            "rs_n": TOTAL_CHUNKS,
-            "data": base64.b64encode(chunk).decode('utf-8')
-        }
+    print(f"📡 Diffusion des QR codes - fichier: {filename}")
+    print(f"Taille fichier: {len(data)} octets, chunks: {len(all_chunks)}, groupes: {total_groups}")
 
-        qr = qrcode.make(json.dumps(payload))
-        show_qr_image(qr)
+    # Diffuse groupe par groupe
+    qr_index = 0
+    for group_idx in range(total_groups):
+        # Extraction des chunks du groupe (avec padding si nécessaire)
+        start = group_idx * K
+        end = start + K
+        group_chunks = all_chunks[start:end]
+        # Pad les chunks pour qu'ils fassent tous CHUNK_SIZE
+        group_chunks = [pad_chunk(c, CHUNK_SIZE) for c in group_chunks]
+        # Si moins de k chunks, pad pour arriver à k
+        while len(group_chunks) < K:
+            group_chunks.append(b'\x00' * CHUNK_SIZE)
 
-        print(f"[{i+1}/{TOTAL_CHUNKS}] QR affiché.")
-        time.sleep(interval_ms / 1000.0)
+        # Encode RS sur le groupe (k data + n-k parité)
+        encoded_chunks = encode_rs_group(group_chunks, N, K)
+
+        # Génère et affiche les QR codes pour ce groupe
+        for i, chunk in enumerate(encoded_chunks):
+            payload = {
+                "file_name": filename,
+                "file_hash": file_hash,
+                "group_index": group_idx,
+                "total_groups": total_groups,
+                "chunk_index": i,
+                "chunks_per_group": N,
+                "data_chunks": K,
+                "chunk_size": len(chunk),
+                "chunk_hash": sha256(chunk),
+                "data": base64.b64encode(chunk).decode("utf-8"),
+            }
+
+            json_payload = json.dumps(payload)
+            qr = qrcode.make(json_payload)
+            show_qr_image(qr)
+
+            qr_index += 1
+            print(f"[QR {qr_index}] Group {group_idx+1}/{total_groups} chunk {i+1}/{N} affiché")
+            time.sleep(interval_ms / 1000.0)
 
     if USE_CV2:
-        print("✅ Fin de la diffusion. Appuyez sur une touche pour fermer la fenêtre.")
+        print("✅ Diffusion terminée. Appuyez sur une touche pour fermer.")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Afficher des QR codes RS(n,k) à partir d’un fichier avec intervalle en millisecondes.")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Diffuse un fichier en QR codes avec correction RS(n,k) par groupe."
+    )
     parser.add_argument("file", help="Chemin du fichier à encoder")
-    parser.add_argument("-i", "--interval", type=int, default=1000, help="Intervalle entre QR codes (millisecondes)")
+    parser.add_argument("-i", "--interval", type=int, default=1000, help="Intervalle entre QR en ms")
     args = parser.parse_args()
 
-    encode_and_show(args.file, args.interval)
+    encode_file_to_qrs(args.file, args.interval)
+
+if __name__ == "__main__":
+    main()
